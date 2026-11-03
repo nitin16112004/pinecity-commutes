@@ -24,7 +24,7 @@ const cfg = {
   parmar2: process.env.PARMAR_CONTACT_2 || '+91 7807288728'
 };
 
-for (const k of ['databaseUrl', 'verifyToken']) {
+for (const k of ['verifyToken']) {
   if (!cfg[k]) {
     console.error(`Missing required environment variable for "${k}". Check your .env / hosting settings.`);
     process.exit(1);
@@ -54,15 +54,19 @@ const ROLES = {
 };
 
 // ---------- Database ----------
-const pool = new pg.Pool({
+const pool = cfg.databaseUrl ? new pg.Pool({
   connectionString: cfg.databaseUrl,
   ssl: cfg.databaseSsl ? { rejectUnauthorized: false } : false,
   max: 10
-});
-pool.on('error', (e) => console.error('[db] idle client error:', e.message));
-const q = (text, params) => pool.query(text, params);
+}) : null;
+if (!pool) console.warn('[config] DATABASE_URL missing; HTTP status endpoints only until database is configured.');
+pool?.on('error', (e) => console.error('[db] idle client error:', e.message));
+const q = (text, params) => pool
+  ? pool.query(text, params)
+  : Promise.reject(new Error('DATABASE_URL is not configured'));
 
 async function initDb() {
+  if (!pool) return;
   const sql = fs.readFileSync(path.join(__dirname, '..', 'schema.sql'), 'utf8');
   await pool.query(sql);
   console.info('[db] schema ready');
@@ -312,6 +316,7 @@ function validSignature(req) {
 app.get('/', (_req, res) => res.json({ service: 'Pinecity Commutes WhatsApp Bot', status: 'online', whatsapp_configured: whatsappConfigured }));
 
 app.get('/health', async (_req, res) => {
+  if (!pool) return res.json({ status: 'setup_required', database: 'not_configured', whatsapp_configured: whatsappConfigured });
   try {
     await q('SELECT 1');
     res.json({ status: 'ok', whatsapp_configured: whatsappConfigured });
@@ -328,7 +333,7 @@ app.get('/webhook', (req, res) => {
 });
 
 app.post('/webhook', (req, res) => {
-  if (!whatsappConfigured) return res.status(503).json({ error: 'whatsapp_not_configured' });
+  if (!whatsappConfigured || !pool) return res.status(503).json({ error: 'setup_required', database_configured: Boolean(pool), whatsapp_configured: whatsappConfigured });
   if (!validSignature(req)) return res.sendStatus(401);
   res.sendStatus(200); // Meta needs an immediate 200
   processEvents(req.body).catch((e) => console.error('[webhook] processing error:', e));
@@ -366,7 +371,7 @@ app.use((err, _req, res, _next) => {
 const initOnly = process.argv.includes('--init-only');
 await initDb();
 if (initOnly) {
-  await pool.end();
+  await pool?.end();
   process.exit(0);
 }
 
@@ -375,7 +380,7 @@ const server = app.listen(cfg.port, () => console.info(`Pinecity Commutes bot li
 const shutdown = (sig) => {
   console.info(`${sig} received, shutting down`);
   server.close(async () => {
-    await pool.end().catch(() => {});
+    if (pool) await pool.end().catch(() => {});
     process.exit(0);
   });
   setTimeout(() => process.exit(1), 10000).unref();
